@@ -1,0 +1,39 @@
+name: Sax Scraper
+
+on:
+  schedule:
+    # 每天凌晨 2 点运行（UTC 时间），可按需修改
+    - cron: '0 2 * * *'
+  workflow_dispatch: # 手动触发用
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install beautifulsoup4 curl_cffi python-dotenv playwright
+        playwright install firefox
+
+    - name: Create .env
+      run: |
+        echo "EMAIL_USER=${{ secrets.EMAIL_USER }}" >> .env
+        echo "EMAIL_PASS=${{ secrets.EMAIL_PASS }}" >> .env
+        echo "SMTP_SERVER=${{ secrets.SMTP_SERVER }}" >> .env
+        echo "SMTP_PORT=${{ secrets.SMTP_PORT }}" >> .env
+        echo "RECIPIENT_EMAIL=${{ secrets.RECIPIENT_EMAIL }}" >> .env
+        echo "INTERVAL_MINUTES=${{ secrets.INTERVAL_MINUTES }}" >> .env
+
+    - name: Run scraper
+      run: |
+        python scraper_auto.py
