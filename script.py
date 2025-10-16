@@ -1,140 +1,169 @@
 import os
 import logging
+import time
+import random
 from bs4 import BeautifulSoup
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from urllib.parse import urljoin
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests
-from apscheduler.schedulers.blocking import BlockingScheduler
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
+from playwright.sync_api import sync_playwright
 
-# 加载环境变量
+# ============ 配置部分 ============
 load_dotenv()
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("scraper.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 
-# 定义目标品牌
-TARGET_BRANDS = ["Selmer", "Otto Link", "Dave Guardala", "Yanagisawa", "Beechler"]
+TARGET_BRANDS = ["Selmer", "Otto", "Guardala", "Yanagisawa", "Beechler", "Yani"]
 
-# 定义目标网站及其选择器
 SITES = [
-    {"url": "http://www.pmwoodwind.com/", "item": ".product-list-item", "name": "h3", "price": ".price", "link": "a"},
+    {"url": "https://www.getasax.com/collections/mouthpieces", "item": ".product-grid-item", "name": ".product-title", "price": ".price", "link": "a"},
     {"url": "https://www.saxquest.com/", "item": ".product-listing", "name": ".product-title", "price": ".product-price", "link": "a"},
-    {"url": "https://www.getasax.com/", "item": ".product-grid-item", "name": ".product-title", "price": ".price", "link": "a"},
     {"url": "https://www.dcsax.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.saxstable.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://saxalley.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.dillonmusic.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.barnardrepair.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.bostonsaxshop.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "http://www.jwsax.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.junkdude.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://stevedeutschmusic.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://saxpoint.nl/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.tenormadness.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
     {"url": "https://www.soundfuga.jp/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.ishibashi-music.jp/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
-    {"url": "https://www.musicgoround.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"}
+    {"url": "https://www.reverb.com/marketplace?query=saxophone", "item": ".product-card", "name": ".product-card-title", "price": ".product-card-price", "link": "a"},
 ]
 
-# 请求头
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
 }
 
-def filter_items(items):
-    """过滤出包含目标品牌的商品"""
-    return [item for item in items if any(brand.lower() in item['name'].lower() for brand in TARGET_BRANDS)]
+# ============ 抓取逻辑部分 ============
 
-def fetch_data_with_curl(site):
-    """使用 curl_cffi 获取数据"""
+def fetch_static_html(url):
+    """尝试静态抓取"""
     try:
-        response = requests.get(site["url"], headers=HEADERS, timeout=10, impersonate="chrome")
-        if response.status_code == 404:
-            logging.warning(f"Page not found: {site['url']}")
-            return []
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        return parse_items(soup, site)
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        if response.status_code == 200:
+            return response.text
     except Exception as e:
-        logging.error(f"Error fetching {site['url']}: {e}")
-        return []
+        logging.warning(f"Static fetch failed for {url}: {e}")
+    return None
+
+def fetch_dynamic_html(url):
+    """用 Playwright 动态加载页面"""
+    try:
+        with sync_playwright() as p:
+            browser = p.firefox.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=60000)
+            time.sleep(random.uniform(3, 5))  # 等待JS加载
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as e:
+        logging.error(f"Dynamic fetch failed for {url}: {e}")
+        return None
 
 def parse_items(soup, site):
-    """解析页面中的商品信息"""
+    """解析商品列表"""
     items = []
     for product in soup.select(site["item"]):
-        name_element = product.select_one(site["name"])
-        price_element = product.select_one(site["price"])
-        link_element = product.select_one(site["link"])
+        name_el = product.select_one(site["name"])
+        price_el = product.select_one(site["price"])
+        link_el = product.select_one(site["link"])
 
-        if name_element and link_element:
-            name = name_element.text.strip()
-            price = price_element.text.strip() if price_element else "Price not listed"
-            link = urljoin(site["url"], link_element["href"])
+        if name_el and link_el:
+            name = name_el.get_text(strip=True)
+            price = price_el.get_text(strip=True) if price_el else "Price not listed"
+            link = urljoin(site["url"], link_el.get("href"))
             items.append({"name": name, "price": price, "link": link})
     return items
 
-def send_email(items, recipient_email):
-    """发送邮件通知"""
-    sender_email = os.getenv("EMAIL_USER")
-    sender_password = os.getenv("EMAIL_PASS")
+def fetch_site_data(site):
+    """自动识别动态/静态页面"""
+    logging.info(f"Fetching {site['url']}")
+    html = fetch_static_html(site["url"])
 
-    if not sender_email or not sender_password:
-        logging.error("Email credentials are missing. Set EMAIL_USER and EMAIL_PASS environment variables.")
+    if not html or len(html) < 5000:  # 静态内容过少 → 动态加载
+        logging.info(f"Switching to dynamic mode for {site['url']}")
+        html = fetch_dynamic_html(site["url"])
+
+    if not html:
+        logging.error(f"Failed to fetch {site['url']}")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    items = parse_items(soup, site)
+    logging.info(f"{site['url']} -> found {len(items)} items")
+    return items
+
+# ============ 邮件逻辑部分 ============
+
+def filter_items(items):
+    return [item for item in items if any(b.lower() in item["name"].lower() for b in TARGET_BRANDS)]
+
+def send_email(items, recipient_email):
+    sender = os.getenv("EMAIL_USER")
+    password = os.getenv("EMAIL_PASS")
+
+    if not sender or not password:
+        logging.error("Missing EMAIL_USER or EMAIL_PASS in .env")
         return
 
-    smtp_server = "smtp.office365.com"
-    smtp_port = 587
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.zoho.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
 
-    subject = "New Saxophone Listings Available!"
-    body = "Here are the latest saxophone listings for your preferred brands:\n\n"
-    for item in items:
-        body += f"{item['name']} - {item['price']} - {item['link']}\n"
+    msg = MIMEMultipart("alternative")
+    msg["From"] = sender
+    msg["To"] = recipient_email
+    msg["Subject"] = "🎷 Latest Saxophone Listings Update"
 
-    msg = MIMEMultipart()
-    msg['From'] = sender_email
-    msg['To'] = recipient_email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
+    if not items:
+        html_body = "<p>No new saxophone listings found today.</p>"
+    else:
+        rows = "".join(
+            f"<tr><td><a href='{i['link']}'>{i['name']}</a></td><td>{i['price']}</td></tr>"
+            for i in items
+        )
+        html_body = f"""
+        <h3>🎷 Latest Saxophone Listings</h3>
+        <table border="1" cellspacing="0" cellpadding="6">
+            <tr><th>Product</th><th>Price</th></tr>
+            {rows}
+        </table>
+        """
+
+    msg.attach(MIMEText(html_body, "html"))
 
     try:
         with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
+            server.login(sender, password)
+            server.sendmail(sender, recipient_email, msg.as_string())
         logging.info(f"Email sent successfully to {recipient_email}")
-    except smtplib.SMTPException as e:
+    except Exception as e:
         logging.error(f"Error sending email: {e}")
 
-def main():
-    """主函数"""
-    all_items = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(fetch_data_with_curl, site) for site in SITES]
-        for future in as_completed(futures):
-            all_items.extend(future.result())
+# ============ 主函数部分 ============
 
-    if all_items:
-        send_email(all_items, "kennyllm@hotmail.com")
+def main():
+    logging.info("=== Scraper started ===")
+    all_items = []
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(fetch_site_data, site) for site in SITES]
+        for f in as_completed(futures):
+            all_items.extend(f.result())
+
+    filtered = filter_items(all_items)
+    logging.info(f"Total {len(filtered)} filtered items.")
+    send_email(filtered, "kennyllm@hotmail.com")
+    logging.info("=== Scraper finished ===")
+
 
 if __name__ == "__main__":
-    # 创建调度器
-    scheduler = BlockingScheduler()
-
-    # 添加每天运行一次的任务
-    scheduler.add_job(main, 'cron', hour=2, minute=0)  # 每天凌晨 2 点运行
-
-    try:
-        logging.info("Starting scheduler...")
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Stopping scheduler...")
-        scheduler.shutdown()
+    main()
