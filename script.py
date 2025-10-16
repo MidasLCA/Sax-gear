@@ -1,34 +1,66 @@
+#!/usr/bin/env python3
+# scraper_auto.py
 import os
 import json
 import logging
 import time
 import random
-from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from bs4 import BeautifulSoup
 from curl_cffi import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
-from playwright.sync_api import sync_playwright
 
-# ============ 基础配置 ============
+# Playwright (动态渲染)
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
+
+# Scheduler
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    APS_AVAILABLE = True
+except Exception:
+    APS_AVAILABLE = False
+
+# ======= 配置与环境 =======
 load_dotenv()
-os.makedirs("data", exist_ok=True)
 
+# 必要 env（请在 .env 中设置，示例见下方）
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.zoho.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", EMAIL_USER)
+
+# 调度： 使用 INTERVAL_MINUTES 来配置每隔多少分钟运行一次（默认 60 分钟）
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", 60))
+
+# 其他配置
+DATA_DIR = "data"
+DATA_FILE = os.path.join(DATA_DIR, "last_items.json")
+LOG_FILE = "scraper.log"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# 日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("scraper.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()]
 )
 
-TARGET_BRANDS = ["Selmer", "Otto", "Guardala", "Yanagisawa", "Beechler", "Yani"]
+# 用户可以根据需要定制品牌、站点和 CSS 选择器
+TARGET_BRANDS = [
+    "Selmer", "Otto Link", "Dave Guardala", "Yanagisawa", "Beechler", "Yani", "Otto"
+]
 
 SITES = [
+    # 示例：你可以根据需要增加/修改
     {"url": "https://www.getasax.com/collections/mouthpieces", "item": ".product-grid-item", "name": ".product-title", "price": ".price", "link": "a"},
     {"url": "https://www.saxquest.com/", "item": ".product-listing", "name": ".product-title", "price": ".product-price", "link": "a"},
     {"url": "https://www.dcsax.com/", "item": ".product-item", "name": ".product-title", "price": ".price", "link": "a"},
@@ -43,149 +75,210 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-DATA_FILE = "data/last_items.json"
-
-# ============ 抓取函数 ============
-def fetch_static_html(url):
+# ======= 抓取静态 / 动态 HTML =======
+def fetch_static_html(url, timeout=15):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        if response.status_code == 200:
-            return response.text
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        status = getattr(resp, "status_code", None)
+        if status == 200:
+            return resp.text
+        logging.warning(f"Static fetch {url} returned status {status}")
     except Exception as e:
         logging.warning(f"Static fetch failed for {url}: {e}")
     return None
 
-def fetch_dynamic_html(url):
+def fetch_dynamic_html(url, wait_seconds_range=(2, 5)):
+    if not PLAYWRIGHT_AVAILABLE:
+        logging.error("Playwright not available. Install playwright if you need dynamic rendering.")
+        return None
     try:
         with sync_playwright() as p:
+            # 使用 firefox 或 chromium，headless True
             browser = p.firefox.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, timeout=60000)
-            time.sleep(random.uniform(3, 5))
-            html = page.content()
+            page.set_default_timeout(60000)
+            page.goto(url)
+            # 随机短等待，给 JS 加载时间
+            time.sleep(random.uniform(*wait_seconds_range))
+            content = page.content()
             browser.close()
-            return html
+            return content
     except Exception as e:
         logging.error(f"Dynamic fetch failed for {url}: {e}")
         return None
 
-def parse_items(soup, site):
+# ======= 解析商品 =======
+def parse_items_from_html(html, site):
+    soup = BeautifulSoup(html, "html.parser")
     items = []
-    for product in soup.select(site["item"]):
-        name_el = product.select_one(site["name"])
-        price_el = product.select_one(site["price"])
-        link_el = product.select_one(site["link"])
-
-        if name_el and link_el:
+    for product in soup.select(site.get("item", "")):
+        try:
+            name_el = product.select_one(site.get("name", ""))
+            link_el = product.select_one(site.get("link", ""))
+            price_el = product.select_one(site.get("price", ""))
+            if not name_el or not link_el:
+                continue
             name = name_el.get_text(strip=True)
             price = price_el.get_text(strip=True) if price_el else "Price not listed"
-            link = urljoin(site["url"], link_el.get("href"))
-            items.append({"name": name, "price": price, "link": link})
+            href = link_el.get("href") or link_el.get("data-href") or ""
+            link = urljoin(site["url"], href)
+            items.append({"name": name, "price": price, "link": link, "source": site["url"]})
+        except Exception as e:
+            logging.debug(f"Error parsing a product element on {site['url']}: {e}")
     return items
 
-def fetch_site_data(site):
-    logging.info(f"Fetching {site['url']}")
-    html = fetch_static_html(site["url"])
-
-    if not html or len(html) < 5000:
-        logging.info(f"Switching to dynamic mode for {site['url']}")
-        html = fetch_dynamic_html(site["url"])
+# ======= 单站点抓取（静态优先 -> 动态回退） =======
+def fetch_site(site):
+    url = site["url"]
+    logging.info(f"Fetching {url}")
+    # 先尝试静态请求
+    html = fetch_static_html(url)
+    # 简单判定：如果响应太短或 None，尝试动态渲染
+    if not html or len(html) < 2000:
+        logging.info(f"Static content insufficient for {url}; trying dynamic fetch")
+        html = fetch_dynamic_html(url)
 
     if not html:
-        logging.error(f"Failed to fetch {site['url']}")
+        logging.error(f"Failed to retrieve HTML for {url}")
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
-    items = parse_items(soup, site)
-    logging.info(f"{site['url']} -> found {len(items)} items")
+    items = parse_items_from_html(html, site)
+    logging.info(f"Found {len(items)} items on {url}")
     return items
 
-# ============ 邮件通知 ============
-def filter_items(items):
-    return [item for item in items if any(b.lower() in item["name"].lower() for b in TARGET_BRANDS)]
-
-def send_email(items, recipient_email):
-    sender = os.getenv("EMAIL_USER")
-    password = os.getenv("EMAIL_PASS")
-
-    if not sender or not password:
-        logging.error("Missing EMAIL_USER or EMAIL_PASS in .env")
-        return
-
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.zoho.com")
-    smtp_port = int(os.getenv("SMTP_PORT", 587))
-
-    msg = MIMEMultipart("alternative")
-    msg["From"] = sender
-    msg["To"] = recipient_email
-    msg["Subject"] = "🎷 New Saxophone Listings Found!"
-
+# ======= 过滤、历史对比、数据保存 =======
+def filter_by_brand(items):
     if not items:
-        html_body = "<p>No new saxophone listings found today.</p>"
-    else:
-        rows = "".join(
-            f"<tr><td><a href='{i['link']}'>{i['name']}</a></td><td>{i['price']}</td></tr>"
-            for i in items
-        )
-        html_body = f"""
-        <h3>🎷 New Saxophone Listings</h3>
-        <table border="1" cellspacing="0" cellpadding="6">
-            <tr><th>Product</th><th>Price</th></tr>
-            {rows}
-        </table>
-        """
+        return []
+    brands_l = [b.lower() for b in TARGET_BRANDS]
+    filtered = [it for it in items if any(b in it["name"].lower() for b in brands_l)]
+    return filtered
 
-    msg.attach(MIMEText(html_body, "html"))
-
+def load_previous():
+    if not os.path.exists(DATA_FILE):
+        return []
     try:
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.sendmail(sender, recipient_email, msg.as_string())
-        logging.info(f"Email sent successfully to {recipient_email}")
-    except Exception as e:
-        logging.error(f"Error sending email: {e}")
-
-# ============ 数据记录 ============
-def load_previous_items():
-    if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return []
+    except Exception as e:
+        logging.error(f"Failed to load previous data: {e}")
+        return []
 
-def save_current_items(items):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+def save_current(items):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to save current data: {e}")
 
 def find_new_items(current, previous):
-    prev_links = {i["link"] for i in previous}
-    return [i for i in current if i["link"] not in prev_links]
+    prev_links = {i.get("link") for i in previous if i.get("link")}
+    new = [i for i in current if i.get("link") and i.get("link") not in prev_links]
+    return new
 
-# ============ 主函数 ============
-def main():
-    logging.info("=== Scraper started ===")
+# ======= 邮件发送（HTML） =======
+def send_email(new_items, recipient=RECIPIENT_EMAIL):
+    if not EMAIL_USER or not EMAIL_PASS:
+        logging.error("EMAIL_USER or EMAIL_PASS not set in environment.")
+        return False
+
+    # 组织邮件
+    msg = MIMEMultipart("alternative")
+    # “去人化”发件显示成系统名
+    msg["From"] = f"SaxBot <{EMAIL_USER}>"
+    msg["To"] = recipient
+    msg["Subject"] = "🎷 New Saxophone Listings"
+
+    if not new_items:
+        html = "<p>No new saxophone listings found at this run.</p>"
+    else:
+        rows = ""
+        for item in new_items:
+            name = item.get("name")
+            price = item.get("price")
+            link = item.get("link")
+            source = item.get("source", "")
+            rows += f"<tr><td><a href='{link}' target='_blank'>{name}</a></td><td>{price}</td><td>{source}</td></tr>"
+        html = f"""
+            <h3>🎷 New Saxophone Listings</h3>
+            <table border="1" cellpadding="6" cellspacing="0">
+                <tr><th>Product</th><th>Price</th><th>Source</th></tr>
+                {rows}
+            </table>
+            <p>Sent by SaxBot</p>
+        """
+
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.sendmail(EMAIL_USER, recipient, msg.as_string())
+        logging.info(f"Email sent to {recipient} with {len(new_items)} new items.")
+        return True
+    except Exception as e:
+        logging.error(f"Error sending email: {e}")
+        return False
+
+# ======= 主运行流程 =======
+def run_once():
+    logging.info("=== Run started ===")
     all_items = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(fetch_site, site) for site in SITES]
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if res:
+                    all_items.extend(res)
+            except Exception as e:
+                logging.error(f"Error in site fetch future: {e}")
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(fetch_site_data, site) for site in SITES]
-        for f in as_completed(futures):
-            all_items.extend(f.result())
+    # 过滤品牌
+    filtered = filter_by_brand(all_items)
+    logging.info(f"Total filtered items: {len(filtered)}")
 
-    filtered = filter_items(all_items)
-    logging.info(f"Fetched {len(filtered)} total filtered items.")
-
-    previous = load_previous_items()
+    # 加载历史并找出新增
+    previous = load_previous()
     new_items = find_new_items(filtered, previous)
-    logging.info(f"Detected {len(new_items)} new items since last run.")
+    logging.info(f"New items detected: {len(new_items)}")
 
     if new_items:
-        save_current_items(filtered)
-        send_email(new_items, "kennyllm@hotmail.com")
+        # 保存当前（以便下次对比）
+        save_current(filtered)
+        # 发送邮件
+        send_email(new_items)
     else:
-        logging.info("No new items. Email not sent.")
+        logging.info("No new items to send. Skipping email.")
 
-    logging.info("=== Scraper finished ===")
+    logging.info("=== Run finished ===\n")
 
+# ======= 调度入口 =======
+def start_scheduler(interval_minutes=INTERVAL_MINUTES):
+    if not APS_AVAILABLE:
+        logging.error("APScheduler not installed. To enable scheduling, install apscheduler.")
+        return
 
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(run_once, 'interval', minutes=interval_minutes, next_run_time=None)
+    scheduler.start()
+    logging.info(f"Scheduler started: run every {interval_minutes} minutes.")
+    try:
+        # Keep main thread alive
+        while True:
+            time.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Scheduler stopped by user.")
+        scheduler.shutdown()
+
+# ======= CLI =======
 if __name__ == "__main__":
-    main()
+    # 如果你只希望运行一次，使用 `python scraper_auto.py`
+    # 如果你希望启用内置调度（后台定时），确保 APScheduler 可用并运行 `python scraper_auto.py schedule`
+    import sys
+    mode = sys.argv[1] if len(sys.argv) > 1 else "once"
+    if mode == "schedule":
+        start_scheduler()
+    else:
+        run_once()
