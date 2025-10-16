@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import time
 import random
@@ -12,8 +13,9 @@ from email.mime.multipart import MIMEMultipart
 import smtplib
 from playwright.sync_api import sync_playwright
 
-# ============ 配置部分 ============
+# ============ 基础配置 ============
 load_dotenv()
+os.makedirs("data", exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,10 +43,10 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-# ============ 抓取逻辑部分 ============
+DATA_FILE = "data/last_items.json"
 
+# ============ 抓取函数 ============
 def fetch_static_html(url):
-    """尝试静态抓取"""
     try:
         response = requests.get(url, headers=HEADERS, timeout=15)
         if response.status_code == 200:
@@ -54,13 +56,12 @@ def fetch_static_html(url):
     return None
 
 def fetch_dynamic_html(url):
-    """用 Playwright 动态加载页面"""
     try:
         with sync_playwright() as p:
             browser = p.firefox.launch(headless=True)
             page = browser.new_page()
             page.goto(url, timeout=60000)
-            time.sleep(random.uniform(3, 5))  # 等待JS加载
+            time.sleep(random.uniform(3, 5))
             html = page.content()
             browser.close()
             return html
@@ -69,7 +70,6 @@ def fetch_dynamic_html(url):
         return None
 
 def parse_items(soup, site):
-    """解析商品列表"""
     items = []
     for product in soup.select(site["item"]):
         name_el = product.select_one(site["name"])
@@ -84,11 +84,10 @@ def parse_items(soup, site):
     return items
 
 def fetch_site_data(site):
-    """自动识别动态/静态页面"""
     logging.info(f"Fetching {site['url']}")
     html = fetch_static_html(site["url"])
 
-    if not html or len(html) < 5000:  # 静态内容过少 → 动态加载
+    if not html or len(html) < 5000:
         logging.info(f"Switching to dynamic mode for {site['url']}")
         html = fetch_dynamic_html(site["url"])
 
@@ -101,8 +100,7 @@ def fetch_site_data(site):
     logging.info(f"{site['url']} -> found {len(items)} items")
     return items
 
-# ============ 邮件逻辑部分 ============
-
+# ============ 邮件通知 ============
 def filter_items(items):
     return [item for item in items if any(b.lower() in item["name"].lower() for b in TARGET_BRANDS)]
 
@@ -120,7 +118,7 @@ def send_email(items, recipient_email):
     msg = MIMEMultipart("alternative")
     msg["From"] = sender
     msg["To"] = recipient_email
-    msg["Subject"] = "🎷 Latest Saxophone Listings Update"
+    msg["Subject"] = "🎷 New Saxophone Listings Found!"
 
     if not items:
         html_body = "<p>No new saxophone listings found today.</p>"
@@ -130,7 +128,7 @@ def send_email(items, recipient_email):
             for i in items
         )
         html_body = f"""
-        <h3>🎷 Latest Saxophone Listings</h3>
+        <h3>🎷 New Saxophone Listings</h3>
         <table border="1" cellspacing="0" cellpadding="6">
             <tr><th>Product</th><th>Price</th></tr>
             {rows}
@@ -148,8 +146,22 @@ def send_email(items, recipient_email):
     except Exception as e:
         logging.error(f"Error sending email: {e}")
 
-# ============ 主函数部分 ============
+# ============ 数据记录 ============
+def load_previous_items():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
 
+def save_current_items(items):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+def find_new_items(current, previous):
+    prev_links = {i["link"] for i in previous}
+    return [i for i in current if i["link"] not in prev_links]
+
+# ============ 主函数 ============
 def main():
     logging.info("=== Scraper started ===")
     all_items = []
@@ -160,8 +172,18 @@ def main():
             all_items.extend(f.result())
 
     filtered = filter_items(all_items)
-    logging.info(f"Total {len(filtered)} filtered items.")
-    send_email(filtered, "kennyllm@hotmail.com")
+    logging.info(f"Fetched {len(filtered)} total filtered items.")
+
+    previous = load_previous_items()
+    new_items = find_new_items(filtered, previous)
+    logging.info(f"Detected {len(new_items)} new items since last run.")
+
+    if new_items:
+        save_current_items(filtered)
+        send_email(new_items, "kennyllm@hotmail.com")
+    else:
+        logging.info("No new items. Email not sent.")
+
     logging.info("=== Scraper finished ===")
 
 
