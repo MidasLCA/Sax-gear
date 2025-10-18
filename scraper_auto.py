@@ -27,6 +27,12 @@ try:
     APS_AVAILABLE = True
 except Exception:
     APS_AVAILABLE = False
+smtp_port_str = os.getenv("SMTP_PORT")
+print("DEBUG SMTP_PORT raw:", repr(smtp_port_str))
+try:
+    SMTP_PORT = int(smtp_port_str) if smtp_port_str else 587
+except ValueError:
+    SMTP_PORT = 587
 
 # ======= 配置与环境 =======
 load_dotenv()
@@ -283,5 +289,6 @@ if __name__ == "__main__":
         start_scheduler()
     else:
         run_once()
+
 
 
