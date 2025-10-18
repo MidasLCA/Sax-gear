@@ -35,7 +35,8 @@ load_dotenv()
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.zoho.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT" OR 587))
+SMTP_PORT = int(os.getenv("SMTP_PORT") or 587)
+
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", EMAIL_USER)
 
 # 调度： 使用 INTERVAL_MINUTES 来配置每隔多少分钟运行一次（默认 60 分钟）
@@ -282,4 +283,5 @@ if __name__ == "__main__":
         start_scheduler()
     else:
         run_once()
+
 
